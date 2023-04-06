@@ -1,0 +1,13 @@
+[package]
+name = "trees-ft"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rustfft = "6.1"
+image = "0.24"
+anyhow = "1.0.70"
+itertools = "0.10.5"
+minifb = "0.24.0"
