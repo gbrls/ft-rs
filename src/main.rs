@@ -1,15 +1,53 @@
 use anyhow::{Context, Result};
-use image::{io::Reader as ImageReader, GenericImageView};
+use image::{io::Reader as ImageReader, GenericImage, GenericImageView, Pixel, Rgb, Rgba};
 use itertools::Itertools;
 use minifb::{Key, Window, WindowOptions};
 use rustfft::{num_complex::Complex, FftPlanner};
 
-const WIDTH: usize = 2400;
-const HEIGHT: usize = 1600;
+const WIDTH: usize = 1500;
+const HEIGHT: usize = 800;
 
-fn from_u8_rgb(r: u8, g: u8, b: u8) -> u32 {
-    let (r, g, b) = (r as u32, g as u32, b as u32);
-    (r << 16) | (g << 8) | b
+#[derive(Copy, Clone)]
+enum FTypes {
+    RGB(u8, u8, u8),
+}
+
+impl Into<u32> for FTypes {
+    fn into(self) -> u32 {
+        match self {
+            FTypes::RGB(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+        }
+    }
+}
+
+impl Into<Rgba<u8>> for FTypes {
+    fn into(self) -> Rgba<u8> {
+        match self {
+            FTypes::RGB(r, g, b) => Rgba([r, g, b, 255]),
+        }
+    }
+}
+
+use FTypes::*;
+
+fn set_pixel<T: Into<u32>>(buffer: &mut Vec<u32>, x: usize, y: usize, pixel: T) {
+    if x < WIDTH && y < HEIGHT {
+        buffer[x + y * WIDTH] = pixel.into();
+    }
+}
+
+fn add_pixel<T: Into<u32>>(buffer: &mut Vec<u32>, x: usize, y: usize, pixel: T) {
+    if x < WIDTH && y < HEIGHT {
+        buffer[x + y * WIDTH] |= pixel.into();
+    }
+}
+
+fn get_pixel(buffer: &mut Vec<u32>, x: usize, y: usize) -> u32 {
+    if x < WIDTH && y < HEIGHT {
+        buffer[x + y * WIDTH]
+    } else {
+        0
+    }
 }
 
 fn clear_buf(buffer: &mut Vec<u32>) {
@@ -23,17 +61,64 @@ fn draw_img(buffer: &mut Vec<u32>, img: &image::DynamicImage, line: usize) {
         let i = i as usize;
         let j = j as usize;
         let [r, g, b, a] = p;
-        buffer[i + j * WIDTH] = from_u8_rgb(r, g, b);
+        set_pixel(buffer, i, j, RGB(r, g, b));
 
         if j == line {
-            buffer[i + j * WIDTH] = 0xff0000;
+            set_pixel(buffer, i, j, RGB(0xff, 0, 0));
         }
     }
 }
 
-fn draw_pixel(buffer: &mut Vec<u32>, i: u32, j: u32, pixel: u32) {}
+fn process_freq_domain(freqs: &mut Vec<Complex<f32>>) {
+    for (n, z) in freqs.iter_mut().enumerate() {
+        if n > 0 {
+            z.re *= 1.0 / (n as f32);
+            z.im *= 1.0 / (n as f32);
+        }
+    }
+}
 
-fn fft(draw_buf: &mut Vec<u32>, img: &image::DynamicImage, line: usize) {
+fn draw_freqs(buffer: &mut Vec<u32>, freqs: &[Complex<f32>], RGB(r, g, b): FTypes) {
+    // with skip(1) we remove the DC part
+    for (i, Complex { re, im }) in freqs.iter().skip(1).enumerate() {
+        if i * 2 >= freqs.len() {
+            break;
+        }
+
+        let mag = ((*re) * 0.02f32) as i32;
+        //let mag = (((*re) * 1.0f32).ln() * 50.0f32) as i32;
+        //print!("{} ", mag);
+
+        for m in 0..(mag).abs() {
+            add_pixel(
+                buffer,
+                4 * i + 0,
+                ((HEIGHT as i32) - 400 - m * mag.signum()) as usize,
+                RGB(r, g, b),
+            );
+            add_pixel(
+                buffer,
+                4 * i + 1,
+                ((HEIGHT as i32) - 400 - m * mag.signum()) as usize,
+                RGB(r, g, b),
+            );
+            add_pixel(
+                buffer,
+                4 * i + 2,
+                ((HEIGHT as i32) - 400 - m * mag.signum()) as usize,
+                RGB(r, g, b),
+            );
+            add_pixel(
+                buffer,
+                4 * i + 3,
+                ((HEIGHT as i32) - 400 - m * mag.signum()) as usize,
+                RGB(r, g, b),
+            );
+        }
+    }
+}
+
+fn fft(draw_buf: &mut Vec<u32>, img: &mut image::DynamicImage, line: usize) {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(img.width() as usize);
 
@@ -45,34 +130,42 @@ fn fft(draw_buf: &mut Vec<u32>, img: &image::DynamicImage, line: usize) {
         img.width() as usize
     ];
 
+    // This is a terrible bottleneck, we should use an iterator over the lines of the image
     for (i, j, image::Rgba(p)) in img.pixels() {
         if j == line as u32 {
             let [_, g, _, _] = p;
             buffer[i as usize].re = g as f32;
         }
+
+        if j > line as u32 {
+            break;
+        }
     }
 
     fft.process(&mut buffer);
 
-    // with skip(1) we remove the DC part
-    for (i, Complex { re, im }) in buffer.iter().skip(1).enumerate() {
-        if i * 4 >= buffer.len() {
-            break;
-        }
+    draw_freqs(draw_buf, &buffer, RGB(0xaa, 0, 0xaa));
+    process_freq_domain(&mut buffer);
+    draw_freqs(draw_buf, &buffer, RGB(0xaa, 0xaa, 0));
 
-        let mag = ((*re) * 0.02f32) as i32;
-        //let mag = (((*re) * 1.0f32).ln() * 50.0f32) as i32;
-        //print!("{} ", mag);
+    let fft = planner.plan_fft_inverse(img.width() as usize);
+    fft.process(&mut buffer);
 
-        for m in 0..(mag).abs() {
-            draw_buf[4 * i + 0 + WIDTH * (((HEIGHT as i32) - 400 - m * mag.signum()) as usize)] =
-                0xff00ff;
-            draw_buf[4 * i + 1 + WIDTH * (((HEIGHT as i32) - 400 - m * mag.signum()) as usize)] =
-                0xff00ff;
-            draw_buf[4 * i + 2 + WIDTH * (((HEIGHT as i32) - 400 - m * mag.signum()) as usize)] =
-                0xff00ff;
-            draw_buf[4 * i + 3 + WIDTH * (((HEIGHT as i32) - 400 - m * mag.signum()) as usize)] =
-                0xff00ff;
+    for (n, z) in buffer.iter().enumerate() {
+        let g = (z.re / (HEIGHT as f32)) as u8;
+        //add_pixel(
+        //    draw_buf,
+        //    n + img.width() as usize,
+        //    HEIGHT - 5 - u,
+        //    RGB(0, 0, 0xff),
+        //);
+
+        let rgba: Rgba<u8> = RGB(g, g, g).into();
+        let mark: Rgba<u8> = RGB(0xff, 0x10, 0x10).into();
+
+        if img.in_bounds(n as u32, line as u32) {
+            //img.put_pixel(n as u32, line as u32, mark)
+            img.put_pixel(n as u32, line as u32, rgba)
         }
     }
 }
@@ -85,7 +178,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     let img_fname = &args[1];
-    let img = ImageReader::open(img_fname)?.decode()?;
+    let mut img = ImageReader::open(img_fname)?.decode()?;
 
     let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
 
@@ -110,7 +203,8 @@ fn main() -> Result<()> {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         clear_buf(&mut buffer);
         draw_img(&mut buffer, &img, (frame % HEIGHT));
-        fft(&mut buffer, &img, frame);
+
+        fft(&mut buffer, &mut img, frame);
 
         for (i, j, image::Rgba(p)) in img.pixels() {
             let i = i as usize;
@@ -118,17 +212,9 @@ fn main() -> Result<()> {
             let [r, g, b, a] = p;
 
             if j == (frame % HEIGHT) {
-                //for u in 0..((r as usize) * 2) {
-                //    buffer[i + WIDTH * (HEIGHT - 5 - u)] |= (r as u32) << 16;
-                //}
-
-                for u in 0..((g as usize) * 2) {
-                    buffer[i + WIDTH * (HEIGHT - 5 - u)] |= (g as u32) << 8;
+                for u in 0..((g as f32 * 0.2) as usize) {
+                    add_pixel(&mut buffer, i, HEIGHT - 5 - u, RGB(0, g, 0));
                 }
-
-                //for u in 0..((b as usize) * 2) {
-                //    buffer[i + WIDTH * (HEIGHT - 5 - u)] |= (b as u32);
-                //}
             }
         }
 
